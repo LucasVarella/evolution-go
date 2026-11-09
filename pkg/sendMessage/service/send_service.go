@@ -14,6 +14,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -1092,6 +1093,7 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 				}}
 			}
 			mediaType = "VideoMessage"
+			applyVideoMeta(media.VideoMessage, fileData)
 		case "ptv":
 			if isNewsletter {
 				media = &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
@@ -1113,6 +1115,7 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 				}}
 			}
 			mediaType = "PtvMessage"
+			applyVideoMeta(media.PtvMessage, fileData)
 		case "audio":
 			if isNewsletter {
 				media = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
@@ -1392,6 +1395,7 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 				}}
 			}
 			mediaType = "VideoMessage"
+			applyVideoMeta(media.VideoMessage, fileData)
 		case "ptv":
 			if isNewsletter {
 				media = &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
@@ -1413,6 +1417,7 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 				}}
 			}
 			mediaType = "PtvMessage"
+			applyVideoMeta(media.PtvMessage, fileData)
 		case "audio":
 			if isNewsletter {
 				media = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
@@ -2080,6 +2085,63 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 
 func stringPointer(s string) *string {
 	return &s
+}
+
+// applyVideoMeta fills in the duration, dimensions and thumbnail of a
+// VideoMessage using ffprobe/ffmpeg. Without these fields WhatsApp shows a blank
+// preview and a 00:00 duration. If extraction fails, the message is sent without them.
+func applyVideoMeta(vm *waE2E.VideoMessage, fileData []byte) {
+	if vm == nil || len(fileData) == 0 {
+		return
+	}
+
+	// Use a temporary file: ffprobe fails on a pipe when the mp4 "moov" atom is at the end.
+	f, err := os.CreateTemp("", "evo-video-*")
+	if err != nil {
+		return
+	}
+	defer os.Remove(f.Name())
+	_, werr := f.Write(fileData)
+	if cerr := f.Close(); werr != nil || cerr != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=width,height:format=duration",
+		"-of", "default=noprint_wrappers=1", f.Name()).Output()
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			k, v, _ := strings.Cut(strings.TrimSpace(line), "=")
+			n, perr := strconv.ParseFloat(v, 64)
+			if perr != nil || n <= 0 {
+				continue
+			}
+			switch k {
+			case "duration":
+				vm.Seconds = proto.Uint32(uint32(n + 0.5))
+			case "width":
+				vm.Width = proto.Uint32(uint32(n))
+			case "height":
+				vm.Height = proto.Uint32(uint32(n))
+			}
+		}
+	}
+
+	// Grab a frame at 1s; videos shorter than 1s have no frame there, so fall back to 0s.
+	for _, ss := range []string{"1", "0"} {
+		frame, err := exec.CommandContext(ctx, "ffmpeg", "-v", "error", "-ss", ss, "-i", f.Name(),
+			"-frames:v", "1", "-f", "image2", "-c:v", "png", "pipe:1").Output()
+		if err != nil || len(frame) == 0 {
+			continue
+		}
+		if thumb := makeJPEGThumbnail(frame, 72); thumb != nil {
+			vm.JPEGThumbnail = thumb
+			return
+		}
+	}
 }
 
 // makeJPEGThumbnail decodes raw image bytes and produces a small JPEG
@@ -3290,6 +3352,7 @@ func (s *sendService) sendStatusMedia(client *whatsmeow.Client, data *StatusMedi
 			FileLength:    proto.Uint64(uint64(len(fileData))),
 		}}
 		mediaType = "VideoMessage"
+		applyVideoMeta(media.VideoMessage, fileData)
 	}
 
 	messageID := data.Id
