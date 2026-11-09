@@ -36,6 +36,7 @@ import (
 
 	"github.com/evolution-foundation/evolution-go/pkg/config"
 	producer_interfaces "github.com/evolution-foundation/evolution-go/pkg/events/interfaces"
+	"github.com/evolution-foundation/evolution-go/pkg/hooks"
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	instance_repository "github.com/evolution-foundation/evolution-go/pkg/instance/repository"
 	"github.com/evolution-foundation/evolution-go/pkg/internal/event_types"
@@ -2069,6 +2070,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Unhandled event %s: %+v", mycli.userID, fmt.Sprintf("%T", evt), evt)
 		return
 	}
+
+	// Let optional integrations (see pkg/hooks) observe the event.
+	hooks.Emit(hooks.Event{Instance: mycli.Instance, Client: mycli.WAClient, Raw: rawEvt})
 
 	if doWebhook {
 		postMap["instanceToken"] = mycli.token
