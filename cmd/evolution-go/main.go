@@ -25,6 +25,7 @@ import (
 	call_service "github.com/evolution-foundation/evolution-go/pkg/call/service"
 	chat_handler "github.com/evolution-foundation/evolution-go/pkg/chat/handler"
 	chat_service "github.com/evolution-foundation/evolution-go/pkg/chat/service"
+	"github.com/evolution-foundation/evolution-go/pkg/chatwoot"
 	community_handler "github.com/evolution-foundation/evolution-go/pkg/community/handler"
 	community_service "github.com/evolution-foundation/evolution-go/pkg/community/service"
 	config "github.com/evolution-foundation/evolution-go/pkg/config"
@@ -36,6 +37,7 @@ import (
 	websocket_producer "github.com/evolution-foundation/evolution-go/pkg/events/websocket"
 	group_handler "github.com/evolution-foundation/evolution-go/pkg/group/handler"
 	group_service "github.com/evolution-foundation/evolution-go/pkg/group/service"
+	"github.com/evolution-foundation/evolution-go/pkg/hooks"
 	instance_handler "github.com/evolution-foundation/evolution-go/pkg/instance/handler"
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	instance_repository "github.com/evolution-foundation/evolution-go/pkg/instance/repository"
@@ -225,8 +227,10 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	// web.whatsapp.com origin, gated only by an opaque ephemeral token).
 	passkey_handler.RegisterRoutes(r, whatsmeowService)
 
+	authMiddleware := auth_middleware.NewMiddleware(config, instanceService)
+
 	routes.NewRouter(
-		auth_middleware.NewMiddleware(config, instanceService),
+		authMiddleware,
 		instance_handler.NewInstanceHandler(instanceService, config),
 		user_handler.NewUserHandler(userService),
 		send_handler.NewSendHandler(sendMessageService),
@@ -240,6 +244,21 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 		pollHandler,
 		server_handler.NewServerHandler(),
 	).AssignRoutes(r)
+
+	// Chatwoot integration. Registered before instances connect so no event is missed.
+	chatwootRepository := chatwoot.NewRepository(db)
+	if err := chatwootRepository.Migrate(); err != nil {
+		log.Fatal(err)
+	}
+	chatwootService := chatwoot.NewService(
+		chatwootRepository,
+		chatwoot.NewWhatsApp(sendMessageService, clientPointer),
+		instanceRepository,
+		os.Getenv("CHATWOOT_WEBHOOK_BASE_URL"),
+		loggerWrapper,
+	)
+	hooks.Register(chatwootService.OnEvent)
+	chatwoot.RegisterRoutes(r, authMiddleware.Auth, chatwootService)
 
 	if config.ConnectOnStartup {
 		go whatsmeowService.ConnectOnStartup(config.ClientName)

@@ -23,6 +23,7 @@ import (
 
 	"github.com/chai2010/webp"
 	config "github.com/evolution-foundation/evolution-go/pkg/config"
+	"github.com/evolution-foundation/evolution-go/pkg/hooks"
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
 	"github.com/evolution-foundation/evolution-go/pkg/utils"
@@ -2947,6 +2948,12 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to marshal JSON for queue", instance.Id)
 		return nil, err
 	}
+
+	hooks.Emit(hooks.Event{
+		Instance: instance,
+		Client:   s.clientPointer[instance.Id],
+		Raw:      &hooks.SentMessage{Info: messageSent.Info, Message: messageSent.Message},
+	})
 
 	go s.whatsmeowService.CallWebhook(instance, queueName, values)
 
