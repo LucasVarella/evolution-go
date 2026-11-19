@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/image/webp"
@@ -129,7 +130,15 @@ type MyClient struct {
 	loggerWrapper      *logger_wrapper.LoggerManager
 	qrcodeCount        int
 	passkeyCeremony    *ceremony.Store
+	// Set when the server finishes delivering missed events after a connect.
+	// A connect whose offline sync never completes means the server stopped
+	// delivering (e.g. waiting on an ack) and messages will not arrive.
+	offlineSyncDone atomic.Bool
 }
+
+// offlineSyncStuckTimeout is how long to wait for OfflineSyncCompleted after
+// OfflineSyncPreview before reporting the offline queue as stuck.
+const offlineSyncStuckTimeout = 2 * time.Minute
 
 func (mycli *MyClient) persistMessageAsync(message message_model.Message) {
 	if mycli == nil || mycli.messageRepository == nil {
@@ -1994,7 +2003,21 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "CallRelayLatency"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Got call relay latency %+v", mycli.userID, evt)
+	case *events.OfflineSyncPreview:
+		mycli.offlineSyncDone.Store(false)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Offline sync started: total=%d messages=%d receipts=%d notifications=%d appdata=%d", mycli.userID, evt.Total, evt.Messages, evt.Receipts, evt.Notifications, evt.AppDataChanges)
+		go func(waClient *whatsmeow.Client, preview events.OfflineSyncPreview) {
+			time.Sleep(offlineSyncStuckTimeout)
+			// Only report for the client that is still current and connected.
+			if mycli.WAClient != waClient || !waClient.IsConnected() || mycli.offlineSyncDone.Load() {
+				return
+			}
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] OFFLINE SYNC STUCK: no OfflineSyncCompleted %s after preview (total=%d messages=%d); the server is not delivering missed events, incoming messages will not arrive", mycli.userID, offlineSyncStuckTimeout, preview.Total, preview.Messages)
+		}(mycli.WAClient, *evt)
+		return
 	case *events.OfflineSyncCompleted:
+		mycli.offlineSyncDone.Store(true)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Offline sync completed: count=%d", mycli.userID, evt.Count)
 		doWebhook = true
 		postMap["event"] = "OfflineSyncCompleted"
 	case *events.ConnectFailure:
