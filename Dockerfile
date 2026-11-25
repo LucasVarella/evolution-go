@@ -15,6 +15,14 @@ RUN go mod download
 COPY . .
 
 ARG VERSION=dev
+# Patch local no whatsmeow (figurinha com som: Message.audioStickerMessage, campo 134),
+# equivalente ao PR upstream tulir/whatsmeow#1366. Remover quando o upstream tiver o suporte;
+# se o patch deixar de aplicar após um update do whatsmeow, o build falha aqui de propósito.
+RUN WM_DIR=$(go list -m -f '{{.Dir}}' go.mau.fi/whatsmeow) \
+ && cp -r "$WM_DIR" /whatsmeow && chmod -R u+w /whatsmeow \
+ && git -C /whatsmeow apply /build/patches/whatsmeow-audio-sticker.patch \
+ && go mod edit -replace go.mau.fi/whatsmeow=/whatsmeow
+
 RUN CGO_ENABLED=1 go build -ldflags "-X main.version=${VERSION}" -o server ./cmd/evolution-go
 
 FROM alpine:3.19.1 AS final

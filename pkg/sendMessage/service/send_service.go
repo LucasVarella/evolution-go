@@ -5,6 +5,7 @@ import (
 	"context"
 	crypto_rand "crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -134,8 +136,11 @@ type PollStruct struct {
 }
 
 type StickerStruct struct {
-	Number       string       `json:"number"`
-	Sticker      string       `json:"sticker"`
+	Number  string `json:"number"`
+	Sticker string `json:"sticker"` // URL, data URI ou base64 (WebP já pronto é enviado sem reconversão, mantendo animação)
+	// Áudio opcional (URL, data URI ou base64; qualquer formato que o ffmpeg leia).
+	// Quando presente, envia uma figurinha com som (Message.audioStickerMessage).
+	Audio        string       `json:"audio,omitempty"`
 	Id           string       `json:"id"`
 	Delay        int32        `json:"delay"`
 	MentionedJID []string     `json:"mentionedJid"`
@@ -870,6 +875,12 @@ func convertAudioWithApi(apiUrl string, apiKey string, convertData ConvertAudio)
 }
 
 func convertAudioToOpusWithDuration(inputData []byte) ([]byte, int, error) {
+	data, seconds, err := convertAudioToOpus(inputData, "128k")
+	return data, int(seconds), err
+}
+
+// convertAudioToOpus converte para OGG/Opus mono 48 kHz e retorna a duração em segundos (fracionária).
+func convertAudioToOpus(inputData []byte, bitrate string) ([]byte, float64, error) {
 	cmd := exec.Command("ffmpeg", "-i", "pipe:0",
 		"-f",
 		"ogg",
@@ -879,7 +890,7 @@ func convertAudioToOpusWithDuration(inputData []byte) ([]byte, int, error) {
 		"-avoid_negative_ts",
 		"make_zero",
 		"-b:a",
-		"128k",
+		bitrate,
 		"-ar",
 		"48000",
 		"-ac",
@@ -939,9 +950,8 @@ func convertAudioToOpusWithDuration(inputData []byte) ([]byte, int, error) {
 	hours, _ := strconv.ParseFloat(matches[1], 64)
 	minutes, _ := strconv.ParseFloat(matches[2], 64)
 	seconds, _ := strconv.ParseFloat(matches[3], 64)
-	duration := int(hours*3600 + minutes*60 + seconds)
 
-	return convertedData, duration, nil
+	return convertedData, hours*3600 + minutes*60 + seconds, nil
 }
 
 func (s *sendService) SendMediaFile(data *MediaStruct, fileData []byte, instance *instance_model.Instance) (*MessageSendStruct, error) {
@@ -1582,28 +1592,138 @@ func (s *sendService) sendPollWithRetry(data *PollStruct, instance *instance_mod
 	return nil, fmt.Errorf("failed to send poll after %d attempts", maxRetries)
 }
 
-func convertToWebP(imageData string) ([]byte, error) {
-	var img image.Image
-	var err error
+// Limites de figurinha com som observados no cliente do WhatsApp.
+const (
+	maxStickerAudioBytes   = 1_000_000
+	maxStickerInputBytes   = 25 * 1024 * 1024
+	stickerAudioMimetype   = "audio/ogg; codecs=opus"
+	stickerFetchTimeoutSec = 30
+)
 
-	resp, err := http.Get(imageData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch image from URL: %v", err)
+// fetchStickerInput aceita URL http(s), data URI ou base64 puro.
+func fetchStickerInput(input string) ([]byte, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return nil, errors.New("empty input")
 	}
-	defer resp.Body.Close()
 
-	img, _, err = image.Decode(resp.Body)
+	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+		httpClient := &http.Client{Timeout: stickerFetchTimeoutSec * time.Second}
+		resp, err := httpClient.Get(input)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch from URL: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("failed to fetch from URL: status %d", resp.StatusCode)
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, maxStickerInputBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response body: %v", err)
+		}
+		if len(data) > maxStickerInputBytes {
+			return nil, fmt.Errorf("file exceeds %d bytes", maxStickerInputBytes)
+		}
+		return data, nil
+	}
+
+	if strings.HasPrefix(input, "data:") {
+		_, payload, ok := strings.Cut(input, ",")
+		if !ok {
+			return nil, errors.New("invalid data URI")
+		}
+		input = payload
+	}
+
+	data, err := base64.StdEncoding.DecodeString(input)
+	if err != nil {
+		if data, err = base64.RawStdEncoding.DecodeString(input); err != nil {
+			return nil, fmt.Errorf("invalid URL or base64: %v", err)
+		}
+	}
+	return data, nil
+}
+
+// isWebP verifica o cabeçalho RIFF....WEBP.
+func isWebP(data []byte) bool {
+	return len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP"
+}
+
+// inspectWebP lê largura, altura e se o WebP é animado a partir dos chunks RIFF.
+func inspectWebP(data []byte) (width, height uint32, animated bool) {
+	if !isWebP(data) {
+		return 0, 0, false
+	}
+	for pos := 12; pos+8 <= len(data); {
+		id := string(data[pos : pos+4])
+		size := int(binary.LittleEndian.Uint32(data[pos+4 : pos+8]))
+		start := pos + 8
+		end := start + size
+		if size < 0 || end > len(data) {
+			break
+		}
+		p := data[start:end]
+		switch id {
+		case "VP8X":
+			if len(p) >= 10 {
+				animated = animated || p[0]&0x02 != 0
+				width = 1 + (uint32(p[4]) | uint32(p[5])<<8 | uint32(p[6])<<16)
+				height = 1 + (uint32(p[7]) | uint32(p[8])<<8 | uint32(p[9])<<16)
+			}
+		case "ANIM", "ANMF":
+			animated = true
+		case "VP8 ":
+			if width == 0 && len(p) >= 10 {
+				width = uint32(binary.LittleEndian.Uint16(p[6:8]) & 0x3FFF)
+				height = uint32(binary.LittleEndian.Uint16(p[8:10]) & 0x3FFF)
+			}
+		case "VP8L":
+			if width == 0 && len(p) >= 5 {
+				bits := binary.LittleEndian.Uint32(p[1:5])
+				width = (bits & 0x3FFF) + 1
+				height = ((bits >> 14) & 0x3FFF) + 1
+			}
+		}
+		pos = end + size&1
+	}
+	return width, height, animated
+}
+
+// convertAudioToStickerOpus converte o áudio para Opus, baixando o bitrate até caber no limite da figurinha.
+func convertAudioToStickerOpus(input []byte) ([]byte, uint32, error) {
+	var lastLen int
+	for _, bitrate := range []string{"96k", "64k", "48k", "32k"} {
+		data, seconds, err := convertAudioToOpus(input, bitrate)
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(data) <= maxStickerAudioBytes {
+			return data, uint32(max(1, math.Ceil(seconds))), nil
+		}
+		lastLen = len(data)
+	}
+	return nil, 0, fmt.Errorf("sticker audio too long: %d bytes after conversion (max %d)", lastLen, maxStickerAudioBytes)
+}
+
+// stickerWebP devolve o WebP da figurinha. WebP recebido é usado como está (preserva animação);
+// outras imagens são convertidas para WebP estático.
+func stickerWebP(input string) ([]byte, error) {
+	data, err := fetchStickerInput(input)
+	if err != nil {
+		return nil, err
+	}
+	if isWebP(data) {
+		return data, nil
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode image: %v", err)
 	}
-
-	var webpBuffer bytes.Buffer
-	err = webp.Encode(&webpBuffer, img, &webp.Options{Lossless: false, Quality: 80})
-	if err != nil {
+	var buf bytes.Buffer
+	if err := webp.Encode(&buf, img, &webp.Options{Lossless: false, Quality: 80}); err != nil {
 		return nil, fmt.Errorf("failed to encode image to WebP: %v", err)
 	}
-
-	return webpBuffer.Bytes(), nil
+	return buf.Bytes(), nil
 }
 
 func (s *sendService) SendSticker(data *StickerStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
@@ -1612,36 +1732,63 @@ func (s *sendService) SendSticker(data *StickerStruct, instance *instance_model.
 		return nil, err
 	}
 
-	var uploaded whatsmeow.UploadResponse
-	var filedata []byte
-
-	if strings.HasPrefix(data.Sticker, "http") {
-		webpData, err := convertToWebP(data.Sticker)
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert image to WebP: %v", err)
-		}
-
-		filedata = webpData
-
-		uploaded, err = client.Upload(context.Background(), filedata, whatsmeow.MediaImage)
-		if err != nil {
-			return nil, fmt.Errorf("failed to upload sticker: %v", err)
-		}
-	} else {
-		return nil, fmt.Errorf("invalid sticker URL")
+	filedata, err := stickerWebP(data.Sticker)
+	if err != nil {
+		return nil, fmt.Errorf("failed to process sticker: %v", err)
 	}
 
-	msg := &waE2E.Message{StickerMessage: &waE2E.StickerMessage{
-		URL:           proto.String(uploaded.URL),
-		DirectPath:    proto.String(uploaded.DirectPath),
-		MediaKey:      uploaded.MediaKey,
-		Mimetype:      proto.String(http.DetectContentType(filedata)),
-		FileEncSHA256: uploaded.FileEncSHA256,
-		FileSHA256:    uploaded.FileSHA256,
-		FileLength:    proto.Uint64(uint64(len(filedata))),
-	}}
+	uploaded, err := client.Upload(context.Background(), filedata, whatsmeow.MediaImage)
+	if err != nil {
+		return nil, fmt.Errorf("failed to upload sticker: %v", err)
+	}
 
-	message, err := s.SendMessage(instance, msg, "StickerMessage", &SendDataStruct{
+	now := time.Now()
+	sticker := &waE2E.StickerMessage{
+		URL:               proto.String(uploaded.URL),
+		DirectPath:        proto.String(uploaded.DirectPath),
+		MediaKey:          uploaded.MediaKey,
+		MediaKeyTimestamp: proto.Int64(now.Unix()),
+		Mimetype:          proto.String("image/webp"),
+		FileEncSHA256:     uploaded.FileEncSHA256,
+		FileSHA256:        uploaded.FileSHA256,
+		FileLength:        proto.Uint64(uint64(len(filedata))),
+		StickerSentTS:     proto.Int64(now.UnixMilli()),
+	}
+	if w, h, animated := inspectWebP(filedata); w > 0 && h > 0 {
+		sticker.Width = proto.Uint32(w)
+		sticker.Height = proto.Uint32(h)
+		sticker.IsAnimated = proto.Bool(animated)
+	}
+
+	messageType := "StickerMessage"
+	if strings.TrimSpace(data.Audio) != "" {
+		rawAudio, err := fetchStickerInput(data.Audio)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch sticker audio: %v", err)
+		}
+		audio, seconds, err := convertAudioToStickerOpus(rawAudio)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert sticker audio: %v", err)
+		}
+		audioUploaded, err := client.Upload(context.Background(), audio, whatsmeow.MediaAudio)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload sticker audio: %v", err)
+		}
+		sticker.Audio = &waE2E.StickerMessage_AudioMessage{AudioMessage: &waE2E.AudioMessage{
+			URL:               proto.String(audioUploaded.URL),
+			DirectPath:        proto.String(audioUploaded.DirectPath),
+			MediaKey:          audioUploaded.MediaKey,
+			MediaKeyTimestamp: proto.Int64(now.Unix()),
+			Mimetype:          proto.String(stickerAudioMimetype),
+			FileEncSHA256:     audioUploaded.FileEncSHA256,
+			FileSHA256:        audioUploaded.FileSHA256,
+			FileLength:        proto.Uint64(uint64(len(audio))),
+			Seconds:           proto.Uint32(seconds),
+		}}
+		messageType = "AudioStickerMessage"
+	}
+
+	message, err := s.SendMessage(instance, &waE2E.Message{StickerMessage: sticker}, messageType, &SendDataStruct{
 		Id:           data.Id,
 		Number:       data.Number,
 		Quoted:       data.Quoted,
@@ -2412,6 +2559,13 @@ func (s *sendService) SendList(data *ListStruct, instance *instance_model.Instan
 func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.Message, messageType string, data *SendDataStruct) (*MessageSendStruct, error) {
 	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendMessage called for number: %s, type: %s", instance.Id, data.Number, messageType)
 
+	// Figurinha com som: chega aqui como StickerMessage (com Audio preenchido) para reaproveitar
+	// o tratamento de quoted/menções/encaminhamento e só é embrulhada em audioStickerMessage no envio.
+	audioSticker := messageType == "AudioStickerMessage"
+	if audioSticker {
+		messageType = "StickerMessage"
+	}
+
 	recipient, err := s.validateAndCheckUserExists(data.Number, data.FormatJid, &data.Quoted.MessageID, &data.Quoted.MessageID, instance)
 	if err != nil {
 		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error validating message fields or user check: %v", instance.Id, err)
@@ -2832,6 +2986,13 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 		sendExtra.AdditionalNodes = data.AdditionalNodes
 	}
 
+	if audioSticker {
+		msg = &waE2E.Message{AudioStickerMessage: &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{StickerMessage: msg.GetStickerMessage()},
+		}}
+		messageType = "AudioStickerMessage"
+	}
+
 	response, err := s.clientPointer[instance.Id].SendMessage(context.Background(), recipient, msg, sendExtra)
 	if err != nil {
 		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error sending message: %v", instance.Id, err)
@@ -2895,6 +3056,9 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 		document := msg.GetDocumentMessage()
 		video := msg.GetVideoMessage()
 		sticker := msg.GetStickerMessage()
+		if sticker == nil {
+			sticker = msg.GetAudioStickerMessage().GetMessage().GetStickerMessage()
+		}
 
 		if img != nil {
 			data, err = s.clientPointer[instance.Id].Download(context.Background(), img)

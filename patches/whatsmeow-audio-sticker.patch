@@ -1,0 +1,45 @@
+diff --git a/send.go b/send.go
+index 9bfd84b..320fc2e 100644
+--- a/send.go
++++ b/send.go
+@@ -939,6 +939,8 @@ func getTypeFromMessage(msg *waE2E.Message) string {
+ 		return getTypeFromMessage(msg.ViewOnceMessageV2Extension.Message)
+ 	case msg.LottieStickerMessage != nil:
+ 		return getTypeFromMessage(msg.LottieStickerMessage.Message)
++	case msg.AudioStickerMessage != nil:
++		return getTypeFromMessage(msg.AudioStickerMessage.Message)
+ 	case msg.EphemeralMessage != nil:
+ 		return getTypeFromMessage(msg.EphemeralMessage.Message)
+ 	case msg.DocumentWithCaptionMessage != nil:
+@@ -966,6 +968,8 @@ func getMediaTypeFromMessage(msg *waE2E.Message) string {
+ 		return getMediaTypeFromMessage(msg.ViewOnceMessageV2Extension.Message)
+ 	case msg.LottieStickerMessage != nil:
+ 		return getMediaTypeFromMessage(msg.LottieStickerMessage.Message)
++	case msg.AudioStickerMessage != nil:
++		return getMediaTypeFromMessage(msg.AudioStickerMessage.Message)
+ 	case msg.EphemeralMessage != nil:
+ 		return getMediaTypeFromMessage(msg.EphemeralMessage.Message)
+ 	case msg.DocumentWithCaptionMessage != nil:
+diff --git a/types/events/events.go b/types/events/events.go
+index a273127..3659678 100644
+--- a/types/events/events.go
++++ b/types/events/events.go
+@@ -329,6 +329,7 @@ type Message struct {
+ 	IsViewOnceV2Extension bool // True if the message was unwrapped from a ViewOnceMessageV2Extension
+ 	IsDocumentWithCaption bool // True if the message was unwrapped from a DocumentWithCaptionMessage
+ 	IsLottieSticker       bool // True if the message was unwrapped from a LottieStickerMessage
++	IsAudioSticker        bool // True if the message was unwrapped from an AudioStickerMessage
+ 	IsBotInvoke           bool // True if the message was unwrapped from a BotInvokeMessage
+ 	IsEdit                bool // True if the message was unwrapped from an EditedMessage
+ 
+@@ -410,6 +411,10 @@ func (evt *Message) UnwrapRaw() *Message {
+ 		evt.Message = evt.Message.GetLottieStickerMessage().GetMessage()
+ 		evt.IsLottieSticker = true
+ 	}
++	if evt.Message.GetAudioStickerMessage().GetMessage() != nil {
++		evt.Message = evt.Message.GetAudioStickerMessage().GetMessage()
++		evt.IsAudioSticker = true
++	}
+ 	if evt.Message.GetDocumentWithCaptionMessage().GetMessage() != nil {
+ 		evt.Message = evt.Message.GetDocumentWithCaptionMessage().GetMessage()
+ 		evt.IsDocumentWithCaption = true

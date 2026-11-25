@@ -5212,6 +5212,10 @@ const docTemplate = `{
         "github_com_EvolutionAPI_evolution-go_pkg_sendMessage_service.StickerStruct": {
             "type": "object",
             "properties": {
+                "audio": {
+                    "description": "Opcional: URL, data URI ou base64 do áudio. Envia figurinha com som (audioStickerMessage).",
+                    "type": "string"
+                },
                 "delay": {
                     "type": "integer"
                 },
